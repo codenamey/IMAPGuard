@@ -30,8 +30,11 @@ python imapguard.py
 ## How It Works
 
 • IMAPGuard connects to your email server using the credentials provided in the .env file.
+
 • The program downloads emails from your inbox and uses a combination of Logistic Regression and Random Forest classifiers to identify potential spam.
+
 • Repeatedly identified emails are automatically flagged as spam and handled accordingly.
+
 • The program saves its progress and learned model data, so it can continue learning from where it left off the next time you run it.
 
 ## Contributing
@@ -43,8 +46,11 @@ Contributions to improve IMAPGuard are welcome! Feel free to submit pull request
 This project is licensed under the MIT License. See the LICENSE file for more details.
 
 ## Key Improvements:
+
 • Clarity: The instructions are structured more clearly, guiding the user step by step through the setup and usage process.
+
 • Professionalism: The language is formal and polished, making the project more accessible to a broader audience.
+
 • Detail: Additional information is provided about how the program works and how users can contribute to the project.
 
 Feel free to adapt this further to fit the specific needs or tone of your project!
