@@ -1,0 +1,6 @@
+emails.pkl
+progress.pkl
+repeated_emails.pkl
+spam_filter_model.pkl
+.env
+myenv
