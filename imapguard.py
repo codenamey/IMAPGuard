@@ -10,6 +10,7 @@ import pickle
 import os
 import hashlib
 from dotenv import load_dotenv
+from transformers import pipeline, AutoTokenizer
 
 # Lataa ympäristömuuttujat .env-tiedostosta
 load_dotenv()
@@ -33,7 +34,11 @@ mail = imaplib.IMAP4_SSL(imap_server)
 mail.login(email_user, email_pass)
 mail.select('inbox')
 
-# Vaihe 1: Lataa aiempi edistyminen, jos olemassa
+# Lataa Hugging Facen valmiiksi koulutettu BERT-malli ja tokenisaattori
+bert_classifier = pipeline('text-classification', model='distilbert-base-uncased-finetuned-sst-2-english', device=0)
+tokenizer = AutoTokenizer.from_pretrained('distilbert-base-uncased-finetuned-sst-2-english')
+
+# Lataa aiempi edistyminen, jos olemassa
 if os.path.exists(progress_file):
     with open(progress_file, "rb") as f:
         processed_message_ids, last_processed_count = pickle.load(f)
@@ -77,9 +82,20 @@ else:
 if not hasattr(vectorizer, 'vocabulary_') or not vectorizer.vocabulary_:
     vectorizer.fit(emails)
 
+# Funktio tekstin pilkkomiseen tokenien mukaan
+def split_text_into_chunks(text, tokenizer, chunk_size=512):
+    tokens = tokenizer(text, return_tensors='pt', truncation=False, add_special_tokens=False)['input_ids'][0]
+    chunks = []
+    for i in range(0, len(tokens), chunk_size):
+        chunk_tokens = tokens[i:i + chunk_size]
+        chunk_text = tokenizer.decode(chunk_tokens, clean_up_tokenization_spaces=True)
+        chunks.append(chunk_text)
+    return chunks
+
 print("Classifying emails...")
-for i, uid in enumerate(tqdm(email_uids)):
-    # Tarkista, onko viesti jo käsitelty
+progress_bar = tqdm(email_uids, desc="Processing emails", leave=True)
+
+for i, uid in enumerate(progress_bar):
     if i < last_processed_count:
         continue
 
@@ -106,13 +122,34 @@ for i, uid in enumerate(tqdm(email_uids)):
                 subject = "(No Subject)"
 
             # Viestin tekstin käsittely
-            body = ""  # Alustetaan body
+            body = ""
             if msg.is_multipart():
                 for part in msg.walk():
                     if part.get_content_type() == "text/plain":
                         body = part.get_payload(decode=True).decode(errors='replace')
             else:
                 body = msg.get_payload(decode=True).decode(errors='replace')
+
+            # Yhdistä otsikko ja viesti analyysia varten
+            full_text = f"{subject} {body}"
+
+            # Pilko pitkä viesti tokenien mukaan
+            chunks = split_text_into_chunks(full_text, tokenizer)
+
+            # Käytä BERT-mallia jokaisen palan analysoimiseen
+            is_spam = False
+            for chunk in chunks:
+                # Truncate chunk to ensure it's within the model's limit
+                bert_result = bert_classifier(chunk[:512])
+                bert_label = bert_result[0]['label']
+                if bert_label == 'NEGATIVE':  # NEGATIVE tulkitaan mahdollisesti roskapostiksi
+                    is_spam = True
+                    break
+
+            if is_spam:
+                mail.uid('store', uid, '+FLAGS', r'(\Flagged)')
+                tqdm.write(f"Email '{subject}' flagged as spam by BERT model.")
+                continue
 
             # Luodaan tiiviste viestin sisällöstä ja otsikosta
             email_hash = hashlib.md5((subject + body).encode('utf-8')).hexdigest()
@@ -127,7 +164,7 @@ for i, uid in enumerate(tqdm(email_uids)):
             # Jos viesti on toistunut yli 3 kertaa, merkitään se ja kaikki aiemmat samanlaiset viestit roskapostiksi
             if repeated_emails[email_hash]['count'] > 3:
                 labels.append(1)
-                print(f"Repeated email '{subject}' flagged as spam.")
+                tqdm.write(f"Repeated email '{subject}' flagged as spam.")
 
                 # Merkitään kaikki aikaisemmat viestit, joilla on sama hash, roskapostiksi
                 for spam_uid in repeated_emails[email_hash]['uids']:
@@ -141,7 +178,7 @@ for i, uid in enumerate(tqdm(email_uids)):
             # Muunna uusi sähköposti ja päivitä mallia
             if len(emails) > 1:  # Tarvitaan vähintään 2 datapistettä
                 X = vectorizer.transform(emails)
-                if X.shape[0] == len(labels):  # Varmistetaan, että X ja labels ovat samansuuruisia
+                if X.shape[0] == len(labels):
                     voting_clf.fit(X, labels)  # Päivitetään malli uudella datalla
 
             # Tee ennustus ja käsittele viesti
@@ -149,30 +186,26 @@ for i, uid in enumerate(tqdm(email_uids)):
             prediction = voting_clf.predict(new_data)[0]
 
             if prediction == 1:
-                mail.uid('store', uid, '+FLAGS', r'(\Flagged)')  # Käytetään standardilippua
-                print(f"Flagged email '{subject}' as spam.")
+                mail.uid('store', uid, '+FLAGS', r'(\Flagged)')
+                tqdm.write(f"Flagged email '{subject}' as spam by combined model.")
             else:
-                print(f"Email '{subject}' is not spam.")
+                tqdm.write(f"Email '{subject}' is not spam by combined model.")
 
             # Lisää käsitelty viesti tallennusjoukkoon
             processed_message_ids.add(message_id)
 
-    # Päivitä ja tallenna edistyminen jokaisen viestin jälkeen
     last_processed_count = i + 1
     with open(progress_file, "wb") as f:
         pickle.dump((processed_message_ids, last_processed_count), f)
 
-    # Tallenna sähköpostit ja luokittelut
     with open(emails_file, "wb") as f:
         pickle.dump((emails, labels), f)
 
-    # Tallenna päivitetty malli ja toistuvat viestit
     with open(model_file, "wb") as f:
         pickle.dump((voting_clf, vectorizer), f)
 
     with open(repeated_emails_file, "wb") as f:
         pickle.dump(repeated_emails, f)
 
-# Sulje yhteys palvelimeen
 mail.close()
 mail.logout()

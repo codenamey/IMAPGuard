@@ -8,7 +8,9 @@ IMAPGuard is a Python-based spam filtering tool that leverages machine learning 
 
 Before you begin, make sure you have Python installed on your system. You can install the required Python libraries by running the following command:
 
-pip install imaplib2 scikit-learn numpy pandas tqdm python-dotenv
+pip install imaplib2 scikit-learn numpy pandas tqdm python-dotenv transformers torch 
+
+
 
 ## Configuration
 1. Create a .env file in the root directory of the project with the following contents:
