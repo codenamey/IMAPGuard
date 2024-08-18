@@ -14,7 +14,9 @@ pip install imaplib2 scikit-learn numpy pandas tqdm python-dotenv
 1. Create a .env file in the root directory of the project with the following contents:
 
 IMAP_SERVER= 'your-email-server'
+
 EMAIL_USER = 'user@account.com'
+
 EMAIL_PASS = 'password'
 
 Replace your-email-server, user@account.com, and password with your actual email server, email address, and password, respectively.
