@@ -1,57 +1,48 @@
 import imaplib
 import email
 from email.header import decode_header
-from sklearn.feature_extraction.text import CountVectorizer
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.ensemble import VotingClassifier
 from tqdm import tqdm
 import pickle
 import os
-import hashlib
 from dotenv import load_dotenv
-from transformers import pipeline, AutoTokenizer
+from transformers import pipeline
 
-# Lataa ympäristömuuttujat .env-tiedostosta
+# Load environment variables from .env file
 load_dotenv()
 
-# IMAP-palvelimen asetukset .env-tiedostosta
+# IMAP server settings from .env file
 imap_server = os.getenv('IMAP_SERVER')
 email_user = os.getenv('EMAIL_USER')
 email_pass = os.getenv('EMAIL_PASS')
 
-# Tallennustiedoston polut
+# File paths for saving data
 emails_file = "emails.pkl"
-model_file = "spam_filter_model.pkl"
 progress_file = "progress.pkl"
-repeated_emails_file = "repeated_emails.pkl"
 
-# Toistuvien viestien kirjanpito
-repeated_emails = {}
+# White list of senders/domains that should not be marked as spam
+white_list = ["trusted@example.com", "1702.fi", "traficom.fi", "tulli.fi", "posti.fi", "vero.fi", "kela.fi", "poliisi.fi", "vayla.fi", "vrk.fi", "sahko.fi", "prh"]
 
-# Yhdistä IMAP-palvelimeen ja hae sähköpostit
+# Keywords that likely indicate a legitimate email
+safe_keywords = ["invoice", "receipt", "order", "payment", "renewal", "alert", "notification"]
+
+# Connect to the IMAP server and fetch emails
 mail = imaplib.IMAP4_SSL(imap_server)
 mail.login(email_user, email_pass)
 mail.select('inbox')
 
-# Lataa Hugging Facen valmiiksi koulutettu BERT-malli ja tokenisaattori
-bert_classifier = pipeline('text-classification', model='distilbert-base-uncased-finetuned-sst-2-english', device=0)
-tokenizer = AutoTokenizer.from_pretrained('distilbert-base-uncased-finetuned-sst-2-english')
-
-# Lataa aiempi edistyminen, jos olemassa
+# Load previous progress if it exists
 if os.path.exists(progress_file):
     with open(progress_file, "rb") as f:
         processed_message_ids, last_processed_count = pickle.load(f)
-    print(f"Loaded {len(processed_message_ids)} processed Message-IDs, last processed count: {last_processed_count}.")
 else:
     processed_message_ids = set()
     last_processed_count = 0
 
-# Hae kaikki sähköpostit
+# Fetch all email UIDs
 status, messages = mail.uid('search', None, 'ALL')
 email_uids = messages[0].split()
 
-# Lataa aiemmin kerätyt sähköpostit ja luokittelut, jos olemassa
+# Load previously collected emails and labels if they exist
 if os.path.exists(emails_file):
     with open(emails_file, "rb") as f:
         emails, labels = pickle.load(f)
@@ -59,153 +50,128 @@ else:
     emails = []
     labels = []
 
-# Lataa aiemmin tallennetut toistuvat viestit, jos olemassa
-if os.path.exists(repeated_emails_file):
-    with open(repeated_emails_file, "rb") as f:
-        repeated_emails = pickle.load(f)
+# Define the Ahma-3B model for Finnish
+finnish_model_name = "Finnish-NLP/Ahma-3B"
+generator_finnish = pipeline("text-generation", model=finnish_model_name, tokenizer=finnish_model_name, device=-1)
 
-# Lataa tai luo uusi koneoppimismalli
-if os.path.exists(model_file):
-    with open(model_file, "rb") as f:
-        voting_clf, vectorizer = pickle.load(f)
-else:
-    lr_model = LogisticRegression(max_iter=1000)
-    rf_model = RandomForestClassifier(n_estimators=100)
-    voting_clf = VotingClassifier(estimators=[
-        ('lr', lr_model),
-        ('rf', rf_model)
-    ], voting='hard')  # 'hard' tarkoittaa enemmistöpäätöstä
+# Function to move emails to the Junk folder
+def move_to_junk_folder(mail, uid, junk_folder='Junk'):
+    result = mail.uid('COPY', uid, junk_folder)
+    if result[0] == 'OK':
+        mail.uid('STORE', uid, '+FLAGS', r'(\Deleted)')
+        mail.expunge()
 
-    vectorizer = CountVectorizer()
+# Function to generate text based on input
+def generate_text(generator, input_text, max_length=50):
+    try:
+        result = generator(input_text, max_length=max_length, pad_token_id=generator.tokenizer.eos_token_id, truncation=True)
+        return result[0]['generated_text']
+    except Exception as e:
+        print(f"Error during text generation: {e}")
+        return ""
 
-# Tarkista, onko `vectorizer` sovitettu
-if not hasattr(vectorizer, 'vocabulary_') or not vectorizer.vocabulary_:
-    vectorizer.fit(emails)
+# Print initial status
+print("Processing emails...")
 
-# Funktio tekstin pilkkomiseen tokenien mukaan
-def split_text_into_chunks(text, tokenizer, chunk_size=512):
-    tokens = tokenizer(text, return_tensors='pt', truncation=False, add_special_tokens=False)['input_ids'][0]
-    chunks = []
-    for i in range(0, len(tokens), chunk_size):
-        chunk_tokens = tokens[i:i + chunk_size]
-        chunk_text = tokenizer.decode(chunk_tokens, clean_up_tokenization_spaces=True)
-        chunks.append(chunk_text)
-    return chunks
+total_emails = len(email_uids)
+batch_size = max(1, total_emails // 100)
+start_index = last_processed_count
+end_index = min(start_index + batch_size, total_emails)
 
-print("Classifying emails...")
-progress_bar = tqdm(email_uids, desc="Processing emails", leave=True)
+# Set up the batch progress bar
+batch_progress_bar = tqdm(total=batch_size, desc="Batch Processing", unit="emails", leave=True, position=0)
 
-for i, uid in enumerate(progress_bar):
-    if i < last_processed_count:
-        continue
+try:
+    while start_index < total_emails:
+        # Reset and configure batch progress bar
+        batch_progress_bar.n = 0
+        batch_progress_bar.last_print_n = 0
+        batch_progress_bar.total = min(batch_size, total_emails - start_index)
+        batch_progress_bar.refresh()
 
-    status, msg_data = mail.uid('fetch', uid, '(RFC822)')
-    for response_part in msg_data:
-        if isinstance(response_part, tuple):
-            msg = email.message_from_bytes(response_part[1])
+        for i, uid in enumerate(email_uids[start_index:end_index]):
+            try:
+                status, msg_data = mail.uid('fetch', uid, '(RFC822)')
+                for response_part in msg_data:
+                    if isinstance(response_part, tuple):
+                        msg = email.message_from_bytes(response_part[1])
 
-            # Hanki Message-ID
-            message_id = msg.get("Message-ID")
-            if not message_id or message_id in processed_message_ids:
-                continue  # Ohita, jos viestillä ei ole Message-ID:tä tai se on jo käsitelty
+                        # Get the Message-ID
+                        message_id = msg.get("Message-ID")
+                        if not message_id or message_id in processed_message_ids:
+                            continue
 
-            # Tarkista, onko viestillä otsikko
-            subject_header = msg["Subject"]
-            if subject_header is not None:
-                subject, encoding = decode_header(subject_header)[0]
-                try:
-                    if isinstance(subject, bytes):
-                        subject = subject.decode(encoding if encoding else "utf-8", errors='replace')
-                except LookupError:
-                    subject = subject.decode('utf-8', errors='replace')
-            else:
-                subject = "(No Subject)"
+                        # Decode the email subject
+                        subject_header = msg["Subject"]
+                        if subject_header is not None:
+                            subject, encoding = decode_header(subject_header)[0]
+                            try:
+                                if isinstance(subject, bytes):
+                                    subject = subject.decode(encoding if encoding else "utf-8", errors='replace')
+                            except LookupError:
+                                subject = subject.decode('utf-8', errors='replace')
+                        else:
+                            subject = "(No Subject)"
 
-            # Viestin tekstin käsittely
-            body = ""
-            if msg.is_multipart():
-                for part in msg.walk():
-                    if part.get_content_type() == "text/plain":
-                        body = part.get_payload(decode=True).decode(errors='replace')
-            else:
-                body = msg.get_payload(decode=True).decode(errors='replace')
+                        # Process the email body
+                        body = ""
+                        if msg.is_multipart():
+                            for part in msg.walk():
+                                if part.get_content_type() == "text/plain":
+                                    body = part.get_payload(decode=True).decode(errors='replace')
+                        else:
+                            body = msg.get_payload(decode=True).decode(errors='replace')
 
-            # Yhdistä otsikko ja viesti analyysia varten
-            full_text = f"{subject} {body}"
+                        # Combine subject and body for analysis
+                        full_text = f"{subject} {body}"
 
-            # Pilko pitkä viesti tokenien mukaan
-            chunks = split_text_into_chunks(full_text, tokenizer)
+                        # Check if the sender is in the white list
+                        sender = msg.get("From")
+                        if any(whitelisted in sender for whitelisted in white_list):
+                            tqdm.write(f"Email '{subject}' from '{sender}' is in the white list, skipping spam check.")
+                            continue
 
-            # Käytä BERT-mallia jokaisen palan analysoimiseen
-            is_spam = False
-            for chunk in chunks:
-                # Truncate chunk to ensure it's within the model's limit
-                bert_result = bert_classifier(chunk[:512])
-                bert_label = bert_result[0]['label']
-                if bert_label == 'NEGATIVE':  # NEGATIVE tulkitaan mahdollisesti roskapostiksi
-                    is_spam = True
-                    break
+                        # If the subject or body contains safe keywords, skip spam check
+                        if any(keyword.lower() in full_text.lower() for keyword in safe_keywords):
+                            tqdm.write(f"Email '{subject}' contains safe keywords, skipping spam check.")
+                            continue
 
-            if is_spam:
-                mail.uid('store', uid, '+FLAGS', r'(\Flagged)')
-                tqdm.write(f"Email '{subject}' flagged as spam by BERT model.")
-                continue
+                        # Generate text and classify
+                        try:
+                            generated_text = generate_text(generator_finnish, body, max_length=50)
+                            is_spam = 'spam' in generated_text.lower()
+                        except Exception as e:
+                            tqdm.write(f"Error during text generation: {e}")
+                            is_spam = False
 
-            # Luodaan tiiviste viestin sisällöstä ja otsikosta
-            email_hash = hashlib.md5((subject + body).encode('utf-8')).hexdigest()
+                        if is_spam:
+                            move_to_junk_folder(mail, uid, junk_folder='Junk')
+                            tqdm.write(f"Email '{subject}' moved to Junk folder by classifier.")
+                        else:
+                            tqdm.write(f"Email '{subject}' is not spam.")
 
-            # Tarkistetaan, onko viestiä toistettu useita kertoja
-            if email_hash in repeated_emails:
-                repeated_emails[email_hash]['count'] += 1
-                repeated_emails[email_hash]['uids'].append(uid)
-            else:
-                repeated_emails[email_hash] = {'count': 1, 'uids': [uid]}
+                        # Update progress
+                        processed_message_ids.add(message_id)
+                        batch_progress_bar.update(1)
 
-            # Jos viesti on toistunut yli 3 kertaa, merkitään se ja kaikki aiemmat samanlaiset viestit roskapostiksi
-            if repeated_emails[email_hash]['count'] > 3:
-                labels.append(1)
-                tqdm.write(f"Repeated email '{subject}' flagged as spam.")
+                        # Update the progress file
+                        with open(progress_file, "wb") as f:
+                            pickle.dump((processed_message_ids, last_processed_count), f)
 
-                # Merkitään kaikki aikaisemmat viestit, joilla on sama hash, roskapostiksi
-                for spam_uid in repeated_emails[email_hash]['uids']:
-                    mail.uid('store', spam_uid, '+FLAGS', r'(\Flagged)')
+            except Exception as e:
+                tqdm.write(f"Error processing email UID {uid}: {e}")
+            finally:
+                # Ensure that progress is always updated
+                batch_progress_bar.update(1)
 
-                continue  # Ohitetaan koneoppimismallin käyttö, koska viesti on jo merkitty roskapostiksi
+        # Move to the next batch
+        start_index = end_index
+        end_index = min(start_index + batch_size, total_emails)
 
-            # Lisätään viesti normaalisti käsittelyyn, jos se ei ole toistunut liian monta kertaa
-            emails.append(body)
+finally:
+    # Close the connection to the server
+    mail.close()
+    mail.logout()
 
-            # Muunna uusi sähköposti ja päivitä mallia
-            if len(emails) > 1:  # Tarvitaan vähintään 2 datapistettä
-                X = vectorizer.transform(emails)
-                if X.shape[0] == len(labels):
-                    voting_clf.fit(X, labels)  # Päivitetään malli uudella datalla
-
-            # Tee ennustus ja käsittele viesti
-            new_data = vectorizer.transform([body])
-            prediction = voting_clf.predict(new_data)[0]
-
-            if prediction == 1:
-                mail.uid('store', uid, '+FLAGS', r'(\Flagged)')
-                tqdm.write(f"Flagged email '{subject}' as spam by combined model.")
-            else:
-                tqdm.write(f"Email '{subject}' is not spam by combined model.")
-
-            # Lisää käsitelty viesti tallennusjoukkoon
-            processed_message_ids.add(message_id)
-
-    last_processed_count = i + 1
-    with open(progress_file, "wb") as f:
-        pickle.dump((processed_message_ids, last_processed_count), f)
-
-    with open(emails_file, "wb") as f:
-        pickle.dump((emails, labels), f)
-
-    with open(model_file, "wb") as f:
-        pickle.dump((voting_clf, vectorizer), f)
-
-    with open(repeated_emails_file, "wb") as f:
-        pickle.dump(repeated_emails, f)
-
-mail.close()
-mail.logout()
+    # Close the batch progress bar
+    batch_progress_bar.close()
