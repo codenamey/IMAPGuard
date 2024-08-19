@@ -10,7 +10,7 @@ Before you begin, make sure you have Python installed on your system.
 
 1. **Clone the Repository** (if needed):
    ```bash
-   git clone https://github.com/yourusername/imapguard.git
+   git clone https://github.com/codenamey/imapguard.git
    cd imapguard
    ```
 
