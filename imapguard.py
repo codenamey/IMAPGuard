@@ -175,3 +175,4 @@ finally:
 
     # Close the batch progress bar
     batch_progress_bar.close()
+
