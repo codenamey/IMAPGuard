@@ -10,6 +10,10 @@ import spacy
 import torch
 import gc
 import signal
+import time
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
 
 # Load environment variables from .env file
 load_dotenv()
@@ -22,6 +26,7 @@ email_pass = os.getenv('EMAIL_PASS')
 # File paths for saving data
 emails_file = "emails.pkl"
 progress_file = "progress.pkl"
+replied_senders_file = "replied_senders.pkl"  # File to save replied senders
 
 # White list of senders/domains that should not be marked as spam
 white_list = ["trusted@example.com", "ficora.fi", "1702.fi", "traficom.fi", "tulli.fi", "posti.fi", "vero.fi", "kela.fi", "poliisi.fi", "vayla.fi", "vrk.fi", "sahko.fi", "prh"]
@@ -42,10 +47,21 @@ except:
     spacy.cli.download('en_core_web_sm')
     nlp_english = spacy.load('en_core_web_sm')
 
-# Connect to the IMAP server and fetch emails
-mail = imaplib.IMAP4_SSL(imap_server)
-mail.login(email_user, email_pass)
-mail.select('inbox')
+# Load replied senders list if it exists
+if os.path.exists(replied_senders_file):
+    with open(replied_senders_file, "rb") as f:
+        replied_senders = pickle.load(f)
+else:
+    replied_senders = set()
+
+# Connect to the IMAP server and select the inbox
+def connect_and_select_inbox():
+    mail = imaplib.IMAP4_SSL(imap_server)
+    mail.login(email_user, email_pass)
+    mail.select('inbox')
+    return mail
+
+mail = connect_and_select_inbox()
 
 # Load previous progress if it exists
 if os.path.exists(progress_file):
@@ -70,6 +86,11 @@ else:
 # Define the Ahma-3B model for Finnish
 finnish_model_name = "Finnish-NLP/Ahma-3B"
 generator_finnish = pipeline("text-generation", model=finnish_model_name, tokenizer=finnish_model_name, device=-1, use_cache=False)
+
+# Initialize traditional machine learning models
+vectorizer = TfidfVectorizer(max_features=1000)
+logistic_regression = LogisticRegression()
+random_forest = RandomForestClassifier()
 
 # Function to move emails to the Junk folder
 def move_to_junk_folder(mail, uid, junk_folder='Junk'):
@@ -101,13 +122,18 @@ def preprocess_email_content(content, max_length=512):  # Further reduced max_le
         content = content[:max_length]
     return content
 
-# Function for grammatical analysis using spaCy
-def perform_grammatical_analysis(text, language='fi'):
-    if language == 'fi':
-        doc = nlp_finnish(text)
-    else:
-        doc = nlp_english(text)
-    return doc
+# Function to ensure IMAP connection is still active
+def ensure_mail_connection(mail):
+    try:
+        mail.noop()  # Sends a no-op to keep the connection alive
+    except imaplib.IMAP4.abort:
+        mail = connect_and_select_inbox()
+    return mail
+
+# Function to save replied senders list
+def save_replied_senders():
+    with open(replied_senders_file, "wb") as f:
+        pickle.dump(replied_senders, f)
 
 # Print initial status
 print("Processing emails...")
@@ -130,6 +156,7 @@ try:
 
         for i, uid in enumerate(email_uids[start_index:end_index]):
             try:
+                mail = ensure_mail_connection(mail)
                 status, msg_data = mail.uid('fetch', uid, '(RFC822)')
                 for response_part in msg_data:
                     if isinstance(response_part, tuple):
@@ -164,19 +191,13 @@ try:
                         # Preprocess email content
                         body = preprocess_email_content(body)
 
-                        # Determine language and perform grammatical analysis
-                        if 'fi' in subject.lower() or 'fi' in body.lower():
-                            doc = perform_grammatical_analysis(body, language='fi')
-                        else:
-                            doc = perform_grammatical_analysis(body, language='en')
-
                         # Combine subject and body for analysis
                         full_text = f"{subject} {body}"
 
-                        # Check if the sender is in the white list
+                        # Check if the sender is in the white list or replied senders
                         sender = msg.get("From")
-                        if any(whitelisted in sender for whitelisted in white_list):
-                            tqdm.write(f"Email '{subject}' from '{sender}' is in the white list, skipping spam check.")
+                        if sender in replied_senders or any(whitelisted in sender for whitelisted in white_list):
+                            tqdm.write(f"Email '{subject}' from '{sender}' is in the replied or white list, skipping spam check.")
                             continue
 
                         # If the subject or body contains safe keywords, skip spam check
@@ -197,6 +218,9 @@ try:
                             tqdm.write(f"Email '{subject}' moved to Junk folder by classifier.")
                         else:
                             tqdm.write(f"Email '{subject}' is not spam.")
+                            # Add sender to replied list
+                            replied_senders.add(sender)
+                            save_replied_senders()
 
                         # Update progress
                         processed_message_ids.add(message_id)
@@ -205,6 +229,9 @@ try:
                         # Update the progress file
                         with open(progress_file, "wb") as f:
                             pickle.dump((processed_message_ids, last_processed_count), f)
+
+                        # Delay to avoid overwhelming the mail server
+                        time.sleep(1)
 
             except Exception as e:
                 tqdm.write(f"Error processing email UID {uid}: {e}")
