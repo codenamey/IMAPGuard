@@ -5,7 +5,7 @@ from tqdm import tqdm
 import pickle
 import os
 from dotenv import load_dotenv
-from transformers import pipeline, MarianMTModel, MarianTokenizer
+from transformers import pipeline, MarianMTModel, MarianTokenizer, AutoModelForSequenceClassification, AutoTokenizer
 import spacy
 import torch
 import gc
@@ -54,6 +54,12 @@ marian_en_to_fi_model_name = "Helsinki-NLP/opus-mt-en-fi"
 translator_fi_to_en = pipeline("translation", model=marian_fi_to_en_model_name)
 translator_en_to_fi = pipeline("translation", model=marian_en_to_fi_model_name)
 
+# Load FinBERT model for spam classification
+finbert_model_name = "TurkuNLP/bert-base-finnish-cased-v1"
+finbert_tokenizer = AutoTokenizer.from_pretrained(finbert_model_name)
+finbert_model = AutoModelForSequenceClassification.from_pretrained(finbert_model_name)
+spam_classifier = pipeline("text-classification", model=finbert_model, tokenizer=finbert_tokenizer)
+
 # Load replied senders list if it exists
 if os.path.exists(replied_senders_file):
     with open(replied_senders_file, "rb") as f:
@@ -98,6 +104,10 @@ generator_finnish = pipeline("text-generation", model=finnish_model_name, tokeni
 vectorizer = TfidfVectorizer(max_features=1000)
 logistic_regression = LogisticRegression()
 random_forest = RandomForestClassifier()
+
+# Initialize counters for clean and spam emails
+clean_emails = 0
+spam_emails = 0
 
 # Function to move emails to the Junk folder
 def move_to_junk_folder(mail, uid, junk_folder='Junk'):
@@ -169,7 +179,7 @@ start_index = last_processed_count
 end_index = min(start_index + batch_size, total_emails)
 
 # Set up the batch progress bar
-batch_progress_bar = tqdm(total=batch_size, desc="Batch Processing", unit="emails", leave=True, position=0)
+batch_progress_bar = tqdm(total=batch_size, unit="emails", leave=True, position=0)
 
 try:
     while start_index < total_emails:
@@ -226,26 +236,41 @@ try:
                         sender = msg.get("From")
                         if sender in replied_senders or any(whitelisted in sender for whitelisted in white_list):
                             tqdm.write(f"Email '{subject}' from '{sender}' is in the replied or white list, skipping spam check.")
+                            clean_emails += 1
                             continue
 
                         # If the subject or body contains safe keywords, skip spam check
                         if any(keyword.lower() in full_text.lower() for keyword in safe_keywords):
                             tqdm.write(f"Email '{subject}' contains safe keywords, skipping spam check.")
+                            clean_emails += 1
                             continue
 
-                        # Generate text and classify with timeout
+                        # Generate text and classify with timeout using Ahma-3B model
                         try:
                             generated_text = generate_text_with_timeout(generator_finnish, body, max_length=25, max_new_tokens=10, timeout=30)
-                            is_spam = 'spam' in generated_text.lower()
+                            is_spam_ahma = 'spam' in generated_text.lower()
                         except Exception as e:
                             tqdm.write(f"Error during text generation: {e}")
-                            is_spam = False
+                            is_spam_ahma = False
+
+                        # Classify email using FinBERT model
+                        try:
+                            finbert_result = spam_classifier(full_text)[0]
+                            is_spam_finbert = finbert_result['label'] == 'LABEL_1'  # Assuming LABEL_1 is spam
+                        except Exception as e:
+                            tqdm.write(f"Error during FinBERT classification: {e}")
+                            is_spam_finbert = False
+
+                        # Determine final spam status based on both classifiers
+                        is_spam = is_spam_ahma or is_spam_finbert
 
                         if is_spam:
                             move_to_junk_folder(mail, uid, junk_folder='Junk')
                             tqdm.write(f"Email '{subject}' moved to Junk folder by classifier.")
+                            spam_emails += 1
                         else:
                             tqdm.write(f"Email '{subject}' is not spam.")
+                            clean_emails += 1
                             # Add sender to replied list
                             replied_senders.add(sender)
                             save_replied_senders()
@@ -254,9 +279,9 @@ try:
                         processed_message_ids.add(message_id)
                         batch_progress_bar.update(1)
 
-                        # Update the progress file
-                        with open(progress_file, "wb") as f:
-                            pickle.dump((processed_message_ids, last_processed_count), f)
+                        # Update the description with current statistics
+                        current_progress = (start_index + i + 1) / total_emails * 100
+                        tqdm.write(f"Progress ({current_progress:.2f}%) | Clean messages: {clean_emails} | Spam messages: {spam_emails}")
 
                         # Delay to avoid overwhelming the mail server
                         time.sleep(1)
