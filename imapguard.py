@@ -5,7 +5,7 @@ from tqdm import tqdm
 import pickle
 import os
 from dotenv import load_dotenv
-from transformers import pipeline
+from transformers import pipeline, MarianMTModel, MarianTokenizer
 import spacy
 import torch
 import gc
@@ -14,6 +14,7 @@ import time
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
+from langdetect import detect, LangDetectException
 
 # Load environment variables from .env file
 load_dotenv()
@@ -46,6 +47,12 @@ try:
 except:
     spacy.cli.download('en_core_web_sm')
     nlp_english = spacy.load('en_core_web_sm')
+
+# Load translation models for multilingual analysis
+marian_fi_to_en_model_name = "Helsinki-NLP/opus-mt-fi-en"
+marian_en_to_fi_model_name = "Helsinki-NLP/opus-mt-en-fi"
+translator_fi_to_en = pipeline("translation", model=marian_fi_to_en_model_name)
+translator_en_to_fi = pipeline("translation", model=marian_en_to_fi_model_name)
 
 # Load replied senders list if it exists
 if os.path.exists(replied_senders_file):
@@ -135,6 +142,24 @@ def save_replied_senders():
     with open(replied_senders_file, "wb") as f:
         pickle.dump(replied_senders, f)
 
+# Function to detect language and translate if necessary
+def translate_email_content(content):
+    try:
+        detected_lang = detect(content)
+        if detected_lang == "fi":
+            return content  # No translation needed
+        elif detected_lang == "en":
+            return content  # No translation needed
+        elif detected_lang != "fi":
+            translation = translator_fi_to_en(content)[0]['translation_text']
+            return translation
+        else:
+            translation = translator_en_to_fi(content)[0]['translation_text']
+            return translation
+    except LangDetectException as e:
+        print(f"Error detecting language: {e}")
+        return content
+
 # Print initial status
 print("Processing emails...")
 
@@ -190,6 +215,9 @@ try:
 
                         # Preprocess email content
                         body = preprocess_email_content(body)
+
+                        # Translate email content if necessary
+                        body = translate_email_content(body)
 
                         # Combine subject and body for analysis
                         full_text = f"{subject} {body}"
