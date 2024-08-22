@@ -5,7 +5,7 @@ from tqdm import tqdm
 import pickle
 import os
 from dotenv import load_dotenv
-from transformers import pipeline, MarianMTModel, MarianTokenizer
+from transformers import pipeline
 import spacy
 import torch
 import gc
@@ -121,10 +121,10 @@ def generate_text_with_timeout(generator, input_text, max_length=25, max_new_tok
         signal.alarm(0)  # Reset the alarm
         return result[0]['generated_text']
     except TimeoutError:
-        print("Generation timed out.")
+        tqdm.write("Generation timed out.")
         return ""
     except Exception as e:
-        print(f"Error during text generation: {e}")
+        tqdm.write(f"Error during text generation: {e}")
         return ""
 
 # Function to preprocess email content
@@ -161,10 +161,10 @@ def translate_email_content(content):
             translation = translator_en_to_fi(content)[0]['translation_text']
             return translation
     except LangDetectException as e:
-        print(f"Error detecting language: {e}")
+        tqdm.write(f"Error detecting language: {e}")
         return content
 
-# Function to update models using the not_spam folder and move emails back to the inbox
+# Update models with not_spam data
 def update_models_with_not_spam():
     not_spam_texts = []
     not_spam_labels = []
@@ -253,7 +253,7 @@ start_index = last_processed_count
 end_index = min(start_index + batch_size, total_emails)
 
 # Set up the batch progress bar
-batch_progress_bar = tqdm(total=batch_size, unit="emails", leave=True, position=0)
+batch_progress_bar = tqdm(total=batch_size, unit="emails", leave=True)
 
 try:
     while start_index < total_emails:
@@ -262,6 +262,12 @@ try:
         batch_progress_bar.last_print_n = 0
         batch_progress_bar.total = min(batch_size, total_emails - start_index)
         batch_progress_bar.refresh()
+
+        # Initialize a dictionary to track subject counts
+        subject_counter = {}
+
+        # Define a threshold for the number of repetitions before marking as spam
+        subject_spam_threshold = 2
 
         for i, uid in enumerate(email_uids[start_index:end_index]):
             try:
@@ -287,6 +293,19 @@ try:
                                 subject = subject.decode('utf-8', errors='replace')
                         else:
                             subject = "(No Subject)"
+
+                        # Check if the subject has been seen before and increment the counter
+                        if subject in subject_counter:
+                            subject_counter[subject] += 1
+                        else:
+                            subject_counter[subject] = 1
+
+                        # If the subject repeats too many times, mark the email as spam
+                        if subject_counter[subject] > subject_spam_threshold:
+                            tqdm.write(f"Email '{subject}' has been repeated {subject_counter[subject]} times. Marking as spam.")
+                            move_to_junk_folder(mail, uid, junk_folder='Junk')
+                            spam_emails += 1
+                            continue
 
                         # Process the email body
                         body = ""
@@ -341,8 +360,8 @@ try:
 
                         # Update the description with current statistics
                         current_progress = (start_index + i + 1) / total_emails * 100
-                        tqdm.write(f"Progress ({current_progress:.2f}%)", position=1)
-                        tqdm.write(f"Clean messages: {clean_emails} | Spam messages: {spam_emails}", position=0)
+                        tqdm.write(f"Progress ({current_progress:.2f}%)")
+                        tqdm.write(f"Clean messages: {clean_emails} | Spam messages: {spam_emails}")
 
                         # Delay to avoid overwhelming the mail server
                         time.sleep(1)
