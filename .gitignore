@@ -13,4 +13,4 @@ myenvnsource/
 replied_senders.pkl
 subject_history.pkl
 tools/__pycache__/*
-
+tests/__pycache__
