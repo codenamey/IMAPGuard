@@ -15,7 +15,6 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from langdetect import detect, LangDetectException
-import re
 
 # Load environment variables from .env file
 load_dotenv()
@@ -133,26 +132,6 @@ def preprocess_email_content(content, max_length=512):  # Further reduced max_le
     if len(content) > max_length:
         content = content[:max_length]
     return content
-
-# Function to analyze email headers
-def analyze_headers(msg):
-    received_headers = msg.get_all('Received')
-    from_header = msg.get('From')
-    suspicious_signs = False
-
-    # Example check for Received headers consistency
-    if received_headers:
-        for header in received_headers:
-            if "localhost" in header or "127.0.0.1" in header:
-                suspicious_signs = True
-
-    # Check if the "From" header matches common spoofing signs
-    if from_header:
-        if re.search(r"\b(gmail\.com|yahoo\.com)\b", from_header, re.IGNORECASE):
-            if not re.search(r"\b([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,})\b", from_header):
-                suspicious_signs = True
-
-    return suspicious_signs
 
 # Function to ensure IMAP connection is still active
 def ensure_mail_connection(mail):
@@ -327,13 +306,10 @@ try:
                         # Combine subject and body for analysis
                         full_text = f"{subject} {body}"
 
-                        # Analyze headers for suspicious signs
-                        suspicious_headers = analyze_headers(msg)
-
-                        # Check if the sender is in the white list or replied senders
+                        # Check if the sender is in the white list
                         sender = msg.get("From")
-                        if sender in replied_senders or (any(whitelisted in sender for whitelisted in white_list) and not suspicious_headers):
-                            tqdm.write(f"Email '{subject}' from '{sender}' is in the replied or white list and passed header checks, skipping spam check.")
+                        if any(whitelisted in sender for whitelisted in white_list):
+                            tqdm.write(f"Email '{subject}' from '{sender}' is in the white list and passed header checks, skipping spam check.")
                             clean_emails += 1
                             continue
 
@@ -355,17 +331,9 @@ try:
                             move_to_junk_folder(mail, uid, junk_folder='Junk')
                             tqdm.write(f"Email '{subject}' moved to Junk folder by classifier.")
                             spam_emails += 1
-
-                            # Consider removing the sender from the whitelist if spam is detected
-                            if any(whitelisted in sender for whitelisted in white_list):
-                                white_list.remove(sender)
-                                tqdm.write(f"Sender '{sender}' removed from whitelist due to spam detection.")
                         else:
                             tqdm.write(f"Email '{subject}' is not spam.")
                             clean_emails += 1
-                            # Add sender to replied list
-                            replied_senders.add(sender)
-                            save_replied_senders()
 
                         # Update progress
                         processed_message_ids.add(message_id)
