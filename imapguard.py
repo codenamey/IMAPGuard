@@ -5,7 +5,7 @@ from tqdm import tqdm
 import pickle
 import os
 from dotenv import load_dotenv
-from transformers import pipeline, MarianMTModel, MarianTokenizer, AutoModelForSequenceClassification, AutoTokenizer
+from transformers import pipeline, MarianMTModel, MarianTokenizer
 import spacy
 import torch
 import gc
@@ -54,12 +54,6 @@ marian_en_to_fi_model_name = "Helsinki-NLP/opus-mt-en-fi"
 translator_fi_to_en = pipeline("translation", model=marian_fi_to_en_model_name)
 translator_en_to_fi = pipeline("translation", model=marian_en_to_fi_model_name)
 
-# Load FinBERT model for spam classification
-finbert_model_name = "TurkuNLP/bert-base-finnish-cased-v1"
-finbert_tokenizer = AutoTokenizer.from_pretrained(finbert_model_name)
-finbert_model = AutoModelForSequenceClassification.from_pretrained(finbert_model_name)
-spam_classifier = pipeline("text-classification", model=finbert_model, tokenizer=finbert_tokenizer)
-
 # Load replied senders list if it exists
 if os.path.exists(replied_senders_file):
     with open(replied_senders_file, "rb") as f:
@@ -68,10 +62,10 @@ else:
     replied_senders = set()
 
 # Connect to the IMAP server and select the inbox
-def connect_and_select_inbox():
+def connect_and_select_inbox(folder='inbox'):
     mail = imaplib.IMAP4_SSL(imap_server)
     mail.login(email_user, email_pass)
-    mail.select('inbox')
+    mail.select(folder)
     return mail
 
 mail = connect_and_select_inbox()
@@ -170,6 +164,86 @@ def translate_email_content(content):
         print(f"Error detecting language: {e}")
         return content
 
+# Function to update models using the not_spam folder and move emails back to the inbox
+def update_models_with_not_spam():
+    not_spam_texts = []
+    not_spam_labels = []
+
+    # Connect to the IMAP server and select the not_spam folder
+    mail = connect_and_select_inbox(folder='not_spam')
+
+    # Fetch all email UIDs from the not_spam folder
+    status, messages = mail.uid('search', None, 'ALL')
+    not_spam_uids = messages[0].split()
+
+    for uid in not_spam_uids:
+        status, msg_data = mail.uid('fetch', uid, '(RFC822)')
+        for response_part in msg_data:
+            if isinstance(response_part, tuple):
+                msg = email.message_from_bytes(response_part[1])
+
+                # Process the email subject and body
+                subject = msg["Subject"] if msg["Subject"] else "(No Subject)"
+                body = ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        if part.get_content_type() == "text/plain":
+                            body = part.get_payload(decode=True).decode(errors='replace')
+                else:
+                    body = msg.get_payload(decode=True).decode(errors='replace')
+
+                # Preprocess and translate the email content if necessary
+                full_text = f"{subject} {body}"
+                full_text = preprocess_email_content(full_text)
+                full_text = translate_email_content(full_text)
+
+                not_spam_texts.append(full_text)
+                not_spam_labels.append(0)  # Not spam label
+
+        # Move the email back to the inbox
+        result = mail.uid('COPY', uid, 'inbox')
+        if result[0] == 'OK':
+            mail.uid('STORE', uid, '+FLAGS', r'(\Deleted)')
+            mail.expunge()
+
+    if not_spam_texts:
+        # Ensure labels and emails lists are consistent
+        if len(emails) != len(labels):
+            tqdm.write("Warning: Length mismatch between emails and labels. Adjusting to minimum common length.")
+            min_length = min(len(emails), len(labels))
+            emails[:] = emails[:min_length]
+            labels[:] = labels[:min_length]
+
+        # Load some spam examples from the previously processed data
+        spam_texts = [emails[i] for i in range(len(emails)) if labels[i] == 1]
+        spam_labels = [1] * len(spam_texts)
+
+        # Combine spam and not_spam examples
+        combined_texts = not_spam_texts + spam_texts
+        combined_labels = not_spam_labels + spam_labels
+
+        # Ensure there are at least two classes in the combined data
+        if len(set(combined_labels)) > 1:
+            # Fit the vectorizer if not already fitted
+            if not hasattr(vectorizer, 'vocabulary_'):
+                vectorizer.fit(combined_texts)
+
+            # Transform the combined texts
+            X_combined = vectorizer.transform(combined_texts)
+
+            # Train the models with the combined data
+            logistic_regression.fit(X_combined, combined_labels)
+            random_forest.fit(X_combined, combined_labels)
+
+            tqdm.write("Models updated with not_spam and spam data, and emails moved back to inbox.")
+        else:
+            tqdm.write("Insufficient class diversity to update models. No action taken.")
+    else:
+        tqdm.write("No not_spam data to update models.")
+
+# Update models with not_spam data
+update_models_with_not_spam()
+
 # Print initial status
 print("Processing emails...")
 
@@ -245,24 +319,13 @@ try:
                             clean_emails += 1
                             continue
 
-                        # Generate text and classify with timeout using Ahma-3B model
+                        # Generate text and classify with timeout
                         try:
                             generated_text = generate_text_with_timeout(generator_finnish, body, max_length=25, max_new_tokens=10, timeout=30)
-                            is_spam_ahma = 'spam' in generated_text.lower()
+                            is_spam = 'spam' in generated_text.lower()
                         except Exception as e:
                             tqdm.write(f"Error during text generation: {e}")
-                            is_spam_ahma = False
-
-                        # Classify email using FinBERT model
-                        try:
-                            finbert_result = spam_classifier(full_text)[0]
-                            is_spam_finbert = finbert_result['label'] == 'LABEL_1'  # Assuming LABEL_1 is spam
-                        except Exception as e:
-                            tqdm.write(f"Error during FinBERT classification: {e}")
-                            is_spam_finbert = False
-
-                        # Determine final spam status based on both classifiers
-                        is_spam = is_spam_ahma or is_spam_finbert
+                            is_spam = False
 
                         if is_spam:
                             move_to_junk_folder(mail, uid, junk_folder='Junk')
@@ -281,7 +344,8 @@ try:
 
                         # Update the description with current statistics
                         current_progress = (start_index + i + 1) / total_emails * 100
-                        tqdm.write(f"Progress ({current_progress:.2f}%) | Clean messages: {clean_emails} | Spam messages: {spam_emails}")
+                        tqdm.write(f"Progress ({current_progress:.2f}%)", position=1)
+                        tqdm.write(f"Clean messages: {clean_emails} | Spam messages: {spam_emails}", position=0)
 
                         # Delay to avoid overwhelming the mail server
                         time.sleep(1)
@@ -300,6 +364,11 @@ try:
         end_index = min(start_index + batch_size, total_emails)
 
 finally:
+    # Save progress and replied senders list
+    with open(progress_file, "wb") as f:
+        pickle.dump((processed_message_ids, start_index), f)
+    save_replied_senders()
+
     # Close the connection to the server
     mail.close()
     mail.logout()
