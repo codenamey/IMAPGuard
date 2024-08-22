@@ -4,3 +4,11 @@ repeated_emails.pkl
 spam_filter_model.pkl
 .env
 myenv
+tools/__pycache__
+blacklist.pkl
+imapguard.py.new
+kala.py
+mini.py
+myenvnsource/
+replied_senders.pkl
+subject_history.pkl
