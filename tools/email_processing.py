@@ -6,6 +6,11 @@ from tqdm import tqdm
 
 from conf.config import IMAP_SERVER, EMAIL_USER, EMAIL_PASS
 
+def preprocess_email_content(content, max_length=512):  # Further reduced max_length
+    if len(content) > max_length:
+        content = content[:max_length]
+    return content
+
 def connect_and_select_inbox(folder='inbox'):
     mail = imaplib.IMAP4_SSL(IMAP_SERVER)
     mail.login(EMAIL_USER, EMAIL_PASS)
